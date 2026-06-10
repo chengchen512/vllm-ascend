@@ -54,7 +54,12 @@ from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
 from vllm_ascend.ops.triton.spec_decode.utils import prepare_inputs_padded_kernel
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
-from vllm_ascend.utils import enable_sp, lmhead_tp_enable, shared_expert_dp_enabled
+from vllm_ascend.utils import (
+    enable_sp,
+    is_mtp_spec_decode_method,
+    lmhead_tp_enable,
+    shared_expert_dp_enabled,
+)
 
 
 @contextmanager
@@ -491,7 +496,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         " is not trained."
                     )
 
-        if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
+        if is_mtp_spec_decode_method(self.method) and self.vllm_config.model_config.is_deepseek_mla:
             for _, layer_module in self.model.model.layers.items():
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
@@ -655,7 +660,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     attn_metadata_eagle = builder.build_for_graph_capture(
                         common_attn_metadata,
                         AscendAttentionState.SpecDecoding
-                        if self.method == "mtp"
+                        if is_mtp_spec_decode_method(self.method)
                         else AscendAttentionState.ChunkedPrefill,
                         **extra_attn_metadata_args,
                     )
@@ -1120,7 +1125,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_hidden_states = self.hidden_states[:num_input_tokens]
                 model_hidden_states, model_positions = self.maybe_pad_and_reduce(model_hidden_states, model_positions)
                 model_kwargs["hidden_states"] = model_hidden_states
-                if self.method == "mtp":
+                if is_mtp_spec_decode_method(self.method):
                     model_kwargs["positions"] = model_positions
 
         # step 0
@@ -1169,7 +1174,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     0,
                     self.runner.pcp_manager.pcp_allgather_restore_idx.gpu[: num_input_tokens * self.pcp_size],
                 )
-            if self.method == "mtp":
+            if is_mtp_spec_decode_method(self.method):
                 last_hidden_states = hidden_states
             else:
                 # eagle and eagle3 need allgather last_hidden_states.
@@ -1192,7 +1197,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
         if get_ascend_config().enable_reduce_sample:
-            if self.method in ("eagle3", "dflash", "mtp"):
+            if self.method in ("eagle3", "dflash") or (
+                is_mtp_spec_decode_method(self.method) and not hasattr(self.model.model, "compute_logits")
+            ):
                 draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                 if lmhead_tp_enable():
                     draft_token_ids, token_indices_to_sample = self._align_tensor_and_indices(
@@ -1245,7 +1252,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # However, when lmhead_tp_enable() is disabled, the batch size uses the length after padding.
         # To decouple the scenarios, a judgment is required.
         # That is, the batch size needs to be modified only when lmhead_tp_enable() is enabled.
-        if lmhead_tp_enable() and self.method == "mtp":
+        if lmhead_tp_enable() and is_mtp_spec_decode_method(self.method):
             batch_size = draft_token_ids.shape[0]
 
         # Generate the remaining draft tokens.
@@ -1260,7 +1267,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         hidden_states = hidden_states[token_indices_to_sample]
         token_indices_to_sample = self.arange[:batch_size]
 
-        input_batch_size = num_input_tokens if (self.method == "mtp" or self.use_cuda_graph) else batch_size
+        input_batch_size = (
+            num_input_tokens if (is_mtp_spec_decode_method(self.method) or self.use_cuda_graph) else batch_size
+        )
 
         forward_context = get_forward_context()
         _EXTRA_CTX.num_tokens = input_batch_size
@@ -1354,7 +1363,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             sample_hidden_states = last_hidden_states[token_indices_to_sample]
             if get_ascend_config().enable_reduce_sample:
-                if self.method in ("eagle3", "dflash", "mtp"):
+                if self.method in ("eagle3", "dflash") or (
+                    is_mtp_spec_decode_method(self.method) and not hasattr(self.model.model, "compute_logits")
+                ):
                     draft_token_ids = self.compute_draft_token_ids(sample_hidden_states)
                     if lmhead_tp_enable() and num_indices < draft_token_ids.shape[0]:
                         draft_token_ids = draft_token_ids[:num_indices]
@@ -1602,7 +1613,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             return total_num_output_tokens, token_indices_to_sample, new_cad, None
 
     def model_returns_tuple(self) -> bool:
-        if self.method == "mtp":
+        if is_mtp_spec_decode_method(self.method):
             # DeepSeek-family MTP (deepseek_mtp.py) recycles the post-final-
             # norm hidden, so its forward returns (logit_hidden,
             # recycle_hidden). Other MTP families return a single tensor.
@@ -1610,7 +1621,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             hf_config = getattr(draft_model_config, "hf_config", None)
             architectures = getattr(hf_config, "architectures", []) or []
             return "DeepSeekMTPModel" in architectures
-        return self.method not in ("mtp", "draft_model", "dflash")
+        return self.method not in ("draft_model", "dflash")
 
     def attn_update_stack_num_spec_norm(
         self,
@@ -1663,7 +1674,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             common_attn_metadata.max_query_len = 1
             common_attn_metadata.decode_token_per_req = 1
             common_attn_metadata.attn_state = (
-                AscendAttentionState.SpecDecoding if self.method == "mtp" else AscendAttentionState.ChunkedPrefill
+                AscendAttentionState.SpecDecoding
+                if is_mtp_spec_decode_method(self.method)
+                else AscendAttentionState.ChunkedPrefill
             )
             common_attn_metadata.graph_pad_size = -1
             common_attn_metadata.num_input_tokens = input_batch_size
@@ -2219,7 +2232,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.method == "mtp":
+        if is_mtp_spec_decode_method(self.method):
             if _EXTRA_CTX.flash_comm_v1_enabled and not self.is_multimodal_model:
                 hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states)
                 positions = positions.unsqueeze(-1)
@@ -2236,7 +2249,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         positions: torch.Tensor,
         hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        if self.method == "mtp":
+        if is_mtp_spec_decode_method(self.method):
             if self.enable_shared_expert_dp:
                 last_hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     last_hidden_states.contiguous(), True
