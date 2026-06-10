@@ -28,6 +28,7 @@ from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.ngram_proposer_npu import AscendNgramProposerNPU
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
+from vllm_ascend.utils import is_mtp_spec_decode_method
 
 
 def get_spec_decode_method(method, vllm_config, device, runner):
@@ -39,7 +40,7 @@ def get_spec_decode_method(method, vllm_config, device, runner):
         return AscendSuffixDecodingProposer(vllm_config, runner)
     elif method == "medusa":
         return AscendMedusaProposer(vllm_config, device)
-    elif method in ("eagle", "eagle3", "mtp"):
+    elif method in ("eagle", "eagle3") or is_mtp_spec_decode_method(method):
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":
         return AscendDflashProposer(vllm_config, device, runner)

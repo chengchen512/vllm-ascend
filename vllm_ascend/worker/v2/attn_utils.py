@@ -41,7 +41,7 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, AscendPrefillContextParallelMetadata
 from vllm_ascend.quantization.utils import enable_fa_quant
-from vllm_ascend.utils import calc_split_factor
+from vllm_ascend.utils import calc_split_factor, is_mtp_spec_decode_method
 
 _ATTENTION_MASK_BUILDER = None
 
@@ -165,14 +165,14 @@ def build_attn_state(
     # but only one token is not hit in cache.
     elif np.all(num_scheduled_tokens == 1):
         attn_state = AscendAttentionState.DecodeOnly
-        if vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp":
+        if vllm_config.speculative_config and is_mtp_spec_decode_method(vllm_config.speculative_config.method):
             # SpecDecoding now supports seq_len=1 and seq_len=2
             # In Prefilling Decoding Disaggregation scenario, SpecDecoding
             # need to supports seq_len=1
             attn_state = AscendAttentionState.SpecDecoding
     # Speculative decoding.
     elif np.all(num_valid_tokens == 1):
-        if vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp":
+        if vllm_config.speculative_config and is_mtp_spec_decode_method(vllm_config.speculative_config.method):
             attn_state = AscendAttentionState.SpecDecoding
         else:
             attn_state = AscendAttentionState.ChunkedPrefill

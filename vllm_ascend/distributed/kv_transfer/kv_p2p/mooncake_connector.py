@@ -63,7 +63,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     get_transfer_timeout_value,
     validate_register_region_count,
 )
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import enable_custom_op, is_mtp_spec_decode_method
 
 # isort: off
 if TYPE_CHECKING:
@@ -475,7 +475,7 @@ class KVCacheRecvingThread(threading.Thread):
 
         self.num_draft_layers = 0
         if self.vllm_config.speculative_config is not None:
-            if self.vllm_config.speculative_config.method == "mtp":
+            if is_mtp_spec_decode_method(self.vllm_config.speculative_config.method):
                 # all MTP layer use the same kv cache layer, so only need to transfer once
                 self.num_draft_layers = 1
             elif (

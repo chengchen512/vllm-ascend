@@ -32,7 +32,7 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.platform import NPUPlatform
-from vllm_ascend.utils import has_rope, is_vl_model
+from vllm_ascend.utils import has_rope, is_mtp_spec_decode_method, is_vl_model
 
 if HAS_TRITON:
     from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
@@ -226,7 +226,8 @@ class AscendRotaryEmbedding(RotaryEmbedding):
     ) -> None:
         super().__init__(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, init_cache)
         vllm_config = get_current_vllm_config()
-        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
+        speculative_config = vllm_config.speculative_config
+        self.use_mtp = speculative_config is not None and is_mtp_spec_decode_method(speculative_config.method)
         _record_cos_sin_cache(self.cos_sin_cache)
         _record_cos_and_sin_cache_interleaved(self.cos_sin_cache)
 
@@ -281,7 +282,8 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, scaling_factor, dtype, **extra_kwargs
         )
         vllm_config = get_current_vllm_config()
-        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
+        speculative_config = vllm_config.speculative_config
+        self.use_mtp = speculative_config is not None and is_mtp_spec_decode_method(speculative_config.method)
         _record_cos_sin_cache(self.cos_sin_cache)
 
     def forward_oot(

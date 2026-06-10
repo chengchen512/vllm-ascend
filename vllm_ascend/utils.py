@@ -77,6 +77,14 @@ _CUSTOM_OP_VENDOR_DIR = "custom_transformer"
 _CUSTOM_OP_BASE_DIR = (
     os.path.dirname(__file__) if os.path.isabs(__file__) else os.path.abspath(os.path.dirname(__file__))
 )
+MTP_SPEC_DECODE_METHOD = "mtp"
+MTP_SPEC_DECODE_METHOD_SUFFIX = "_mtp"
+
+
+def is_mtp_spec_decode_method(method: str | None) -> bool:
+    return method == MTP_SPEC_DECODE_METHOD or (
+        isinstance(method, str) and method.endswith(MTP_SPEC_DECODE_METHOD_SUFFIX)
+    )
 
 
 def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:
@@ -913,7 +921,7 @@ def speculative_enable_dispatch_gmm_combine_decode(vllm_config: VllmConfig) -> b
             return quant_type == "w8a8_dynamic"
         else:
             return True
-    if speculative_method == "mtp":
+    if is_mtp_spec_decode_method(speculative_method):
         mtp_quant_type = getattr(vllm_config.model_config.hf_text_config, "mtp_quantize", None)
         return mtp_quant_type == "w8a8_dynamic"
     return False
