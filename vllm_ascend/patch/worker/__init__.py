@@ -74,6 +74,8 @@ import vllm_ascend.patch.worker.patch_v2.patch_use_v2_model_runner  # noqa
 
 if not vllm_version_is("0.23.0"):
     import vllm_ascend.patch.worker.patch_fused_moe  # noqa
+import vllm_ascend.patch.worker.patch_mimo_ernie_mtp  # noqa
+import vllm_ascend.patch.worker.patch_gqa_c8  # noqa
 
 if _V2_MODEL_RUNNER_SUPPORTED:
     import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
