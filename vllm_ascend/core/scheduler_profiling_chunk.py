@@ -41,6 +41,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.core.profiling_chunk_predictor import ProfilingChunkManager
+from vllm_ascend.core.scheduler_utils import get_effective_lookahead_tokens, scheduler_output_compat_kwargs
 
 
 class ProfilingChunkScheduler(Scheduler):
@@ -596,7 +597,7 @@ class ProfilingChunkScheduler(Scheduler):
                     if num_new_tokens == 0:
                         break
 
-                effective_lookahead_tokens = 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                effective_lookahead_tokens = get_effective_lookahead_tokens(self, load_kv_async)
 
                 # Determine if we need to allocate cross-attention blocks.
                 num_encoder_tokens = 0
@@ -741,6 +742,7 @@ class ProfilingChunkScheduler(Scheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            **scheduler_output_compat_kwargs(SchedulerOutput, self, num_scheduled_tokens),
         )
 
         if self.connector is not None:

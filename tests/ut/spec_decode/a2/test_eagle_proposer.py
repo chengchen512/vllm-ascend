@@ -19,6 +19,7 @@ from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import clear_ascend_config, init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.utils import enable_custom_op
@@ -50,6 +51,77 @@ class BatchSpec:
 
     def compute_num_tokens(self):
         return sum(self.query_lens)
+
+
+@dataclass
+class _FakeAttentionConfig:
+    use_non_causal: bool = False
+
+
+@dataclass
+class _FakeModelArchConfig:
+    is_mm_prefix_lm: bool = False
+
+
+@dataclass
+class _FakeModelConfig:
+    model_arch_config: _FakeModelArchConfig
+
+
+@dataclass
+class _FakeVllmConfig:
+    attention_config: _FakeAttentionConfig
+    model_config: _FakeModelConfig
+
+
+class _FakeDflashInputKernel:
+
+    def __getitem__(self, _grid):
+        def run(**kwargs):
+            batch_size = kwargs["batch_size"]
+            num_query_per_req = kwargs["num_query_per_req"]
+            num_speculative_tokens = kwargs["num_speculative_tokens"]
+            num_context = kwargs["total_input_tokens"]
+            num_query_total = batch_size * num_query_per_req
+            block_size = kwargs["block_size"]
+
+            kwargs["out_input_ids_ptr"][:num_query_total].fill_(kwargs["parallel_drafting_token_id"])
+            kwargs["out_input_ids_ptr"][:num_query_total:num_query_per_req] = kwargs["next_token_ids_ptr"]
+            kwargs["out_context_positions_ptr"][:num_context] = kwargs["target_positions_ptr"].to(
+                kwargs["out_context_positions_ptr"].dtype
+            )
+            kwargs["out_context_slot_mapping_ptr"][:num_context] = kwargs["context_slot_mapping_ptr"][:num_context].to(
+                kwargs["out_context_slot_mapping_ptr"].dtype
+            )
+
+            sample_indices = []
+            query_positions = []
+            query_slots = []
+            for req_idx in range(batch_size):
+                context_end = int(kwargs["query_start_loc_ptr"][req_idx + 1].item())
+                last_context_position = int(kwargs["target_positions_ptr"][context_end - 1].item())
+                base = req_idx * num_query_per_req
+                for query_offset in range(num_query_per_req):
+                    position = last_context_position + 1 + query_offset
+                    query_positions.append(position)
+                    block_id = int(kwargs["block_table_ptr"][req_idx, position // block_size].item())
+                    query_slots.append(block_id * block_size + position % block_size)
+                sample_indices.extend(base + i for i in range(1, num_speculative_tokens + 1))
+
+            kwargs["out_query_positions_ptr"][:num_query_total] = torch.tensor(
+                query_positions,
+                dtype=kwargs["out_query_positions_ptr"].dtype,
+            )
+            kwargs["out_query_slot_mapping_ptr"][:num_query_total] = torch.tensor(
+                query_slots,
+                dtype=kwargs["out_query_slot_mapping_ptr"].dtype,
+            )
+            kwargs["out_token_indices_ptr"][:] = torch.tensor(
+                sample_indices,
+                dtype=kwargs["out_token_indices_ptr"].dtype,
+            )
+
+        return run
 
 
 def create_common_attn_metadata(
@@ -120,6 +192,129 @@ def create_common_attn_metadata(
         causal=True,
         positions=positions,
     )
+
+
+@pytest.mark.parametrize(
+    "dflash_causal,expected_use_non_causal",
+    [
+        (False, True),
+        (True, False),
+    ],
+)
+def test_dflash_create_draft_vllm_config_uses_causal_flag(
+    dflash_causal: bool,
+    expected_use_non_causal: bool,
+):
+    proposer = AscendDflashProposer.__new__(AscendDflashProposer)
+    proposer.dflash_causal = dflash_causal
+
+    base_config = _FakeVllmConfig(
+        attention_config=_FakeAttentionConfig(use_non_causal=False),
+        model_config=_FakeModelConfig(
+            model_arch_config=_FakeModelArchConfig(is_mm_prefix_lm=True),
+        ),
+    )
+
+    with patch.object(AscendEagleProposer, "_create_draft_vllm_config", return_value=base_config):
+        draft_config = proposer._create_draft_vllm_config()
+
+    assert draft_config.attention_config.use_non_causal is expected_use_non_causal
+    assert draft_config.model_config.model_arch_config.is_mm_prefix_lm is False
+
+
+def _make_dflash_proposer_for_first_pass(dflash_causal: bool) -> AscendDflashProposer:
+    proposer = AscendDflashProposer.__new__(AscendDflashProposer)
+    proposer.device = torch.device("cpu")
+    proposer.dtype = torch.float32
+    proposer.hidden_size = 4
+    proposer.num_speculative_tokens = 3
+    proposer.parallel_drafting_token_id = 999
+    proposer.kernel_block_size = BLOCK_SIZE
+    proposer.arange_dflash = torch.arange(128, dtype=torch.int32)
+    proposer.token_arange_np = np.arange(128, dtype=np.int32)
+    proposer.input_ids = torch.zeros(32, dtype=torch.int32)
+    proposer.positions = torch.zeros(32, dtype=torch.int32)
+    proposer._context_positions_buffer = torch.zeros(32, dtype=torch.int32)
+    proposer._context_slot_mapping_buffer = torch.zeros(32, dtype=torch.int32)
+    proposer._slot_mapping_buffer = torch.zeros(32, dtype=torch.int32)
+    proposer._dflash_hidden_states = torch.zeros((32, proposer.hidden_size), dtype=proposer.dtype)
+    proposer.dflash_causal = dflash_causal
+    return proposer
+
+
+@pytest.mark.parametrize("dflash_causal", [False, True])
+def test_dflash_set_inputs_first_pass_layout_and_causal_flag(dflash_causal: bool):
+    proposer = _make_dflash_proposer_for_first_pass(dflash_causal)
+    batch_spec = BatchSpec(seq_lens=[10, 8], query_lens=[3, 2])
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec,
+        block_size=BLOCK_SIZE,
+        device=torch.device("cpu"),
+        arange_block_indices=True,
+    )
+    target_token_ids = torch.tensor([10, 11, 12, 20, 21], dtype=torch.int32)
+    target_positions = torch.tensor([7, 8, 9, 6, 7], dtype=torch.int64)
+    target_hidden_states = torch.arange(20, dtype=torch.float32).view(5, 4)
+    next_token_ids = torch.tensor([100, 200], dtype=torch.int32)
+    original_context_slot_mapping = common_attn_metadata.slot_mapping.clone()
+
+    with patch(
+        "vllm_ascend.spec_decode.dflash_proposer.copy_and_expand_dflash_inputs_kernel_single_grid",
+        _FakeDflashInputKernel(),
+    ):
+        num_tokens, token_indices_to_sample, output_cad, long_seq_args = proposer.set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            token_indices_to_sample=None,
+            cad=common_attn_metadata,
+            num_rejected_tokens_gpu=None,
+        )
+
+    assert long_seq_args is None
+    assert num_tokens == 8
+    assert output_cad.causal is dflash_causal
+    assert output_cad.attn_state == AscendAttentionState.ChunkedPrefill
+    assert output_cad.num_actual_tokens == 8
+    assert output_cad.max_query_len == 4
+    assert torch.equal(output_cad.query_start_loc, torch.tensor([0, 4, 8], dtype=torch.int32))
+    assert torch.equal(
+        proposer.input_ids[:num_tokens],
+        torch.tensor([100, 999, 999, 999, 200, 999, 999, 999], dtype=torch.int32),
+    )
+    assert torch.equal(
+        proposer._context_positions_buffer[: target_positions.shape[0]],
+        target_positions.to(torch.int32),
+    )
+    assert torch.equal(
+        proposer.positions[:num_tokens],
+        torch.tensor([10, 11, 12, 13, 8, 9, 10, 11], dtype=torch.int32),
+    )
+    assert torch.equal(
+        proposer._context_slot_mapping_buffer[: target_positions.shape[0]],
+        original_context_slot_mapping.to(torch.int32),
+    )
+    assert torch.equal(
+        output_cad.slot_mapping,
+        torch.tensor([10, 11, 12, 13, 24, 25, 26, 27], dtype=torch.int32),
+    )
+    assert torch.equal(token_indices_to_sample, torch.tensor([1, 2, 3, 5, 6, 7], dtype=torch.int32))
+    assert torch.equal(
+        proposer._dflash_hidden_states[: target_hidden_states.shape[0]],
+        target_hidden_states,
+    )
+
+
+def test_get_spec_decode_method_routes_dflash_to_ascend_dflash_proposer():
+    import vllm_ascend.spec_decode as spec_decode
+
+    expected_proposer = object()
+    with patch.object(spec_decode, "AscendDflashProposer", return_value=expected_proposer) as mock_dflash:
+        proposer = spec_decode.get_spec_decode_method("dflash", "config", "device", "runner")
+
+    assert proposer is expected_proposer
+    mock_dflash.assert_called_once_with("config", "device", "runner")
 
 
 def assert_attr_equal(attr: str | tuple[str, Any, Any], expect: Any, actual: Any) -> None:

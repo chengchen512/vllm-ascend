@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -59,6 +60,33 @@ class AscendDflashProposer(AscendEagleProposer):
         )
 
         self.parallel_drafting_hidden_state_tensor = None
+        self.dflash_causal = self.dflash_config.get("causal", False)
+
+    @property
+    def dflash_config(self) -> dict[str, Any]:
+        return getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
+
+    @property
+    def dflash_use_aux_hidden_state(self) -> bool:
+        return self.dflash_config.get("use_aux_hidden_state", True)
+
+    def _create_draft_vllm_config(self) -> VllmConfig:
+        base = super()._create_draft_vllm_config()
+
+        model_arch_config = getattr(base.model_config, "model_arch_config", None)
+        if getattr(model_arch_config, "is_mm_prefix_lm", False):
+            base.model_config.model_arch_config = replace(
+                model_arch_config,
+                is_mm_prefix_lm=False,
+            )
+
+        return replace(
+            base,
+            attention_config=replace(
+                base.attention_config,
+                use_non_causal=not self.dflash_causal,
+            ),
+        )
 
     def set_inputs_first_pass(
         self,
@@ -143,7 +171,7 @@ class AscendDflashProposer(AscendEagleProposer):
         cad.max_query_len = num_query_per_req
         cad.max_seq_len = cad.max_seq_len + num_query_per_req
         cad.slot_mapping = query_slot_mapping
-        cad.causal = False
+        cad.causal = self.dflash_causal
         cad.attn_mask = None
         cad.attn_state = AscendAttentionState.ChunkedPrefill
 
@@ -192,7 +220,7 @@ class AscendDflashProposer(AscendEagleProposer):
                 max_seq_len=0,
                 slot_mapping=self._slot_mapping_buffer[:num_query_total],
                 attn_state=AscendAttentionState.ChunkedPrefill,
-                causal=False,
+                causal=self.dflash_causal,
                 is_prefilling=torch.zeros(num_reqs, dtype=torch.bool),
                 block_table_tensor=self.runner.input_batch.block_table[self.kv_cache_gid].get_device_tensor()[
                     :num_reqs
@@ -204,7 +232,8 @@ class AscendDflashProposer(AscendEagleProposer):
                 AscendAttentionState.ChunkedPrefill,
             )
 
-            attn_metadata_dflash.attn_mask = None
+            if not self.dflash_causal:
+                attn_metadata_dflash.attn_mask = None
             attn_metadata_dflash.attn_state = AscendAttentionState.ChunkedPrefill
 
             per_layer_attn_metadata = dict()

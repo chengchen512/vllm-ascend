@@ -50,6 +50,11 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.core.scheduler_utils import (
+    get_effective_lookahead_tokens,
+    scheduler_output_compat_kwargs,
+)
+
 
 @dataclass
 class RecomputeSchedulerConfig(SchedulerConfig):
@@ -607,7 +612,7 @@ class RecomputeScheduler(Scheduler):
                 # extra block gets allocated which
                 # creates a mismatch between the number
                 # of local and remote blocks.
-                effective_lookahead_tokens = 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                effective_lookahead_tokens = get_effective_lookahead_tokens(self, load_kv_async)
 
                 # Determine if we need to allocate cross-attention blocks.
                 num_encoder_tokens = 0
@@ -802,6 +807,7 @@ class RecomputeScheduler(Scheduler):
             new_block_ids_to_zero=new_block_ids_to_zero,
             preempted_reqs=preempted_req_data,
             recomputed_reqs=recomputed_reqs,
+            **scheduler_output_compat_kwargs(RecomputeSchedulerOutput, self, num_scheduled_tokens),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

@@ -18,6 +18,7 @@
 #
 
 from contextlib import contextmanager
+from typing import Any
 
 import numpy as np
 import torch
@@ -51,7 +52,6 @@ from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
 from vllm_ascend.worker.v2.spec_decode import init_speculator
-from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
@@ -72,6 +72,7 @@ class NPUModelRunner(GPUModelRunner):
         if self.ascend_config.eplb_config.dynamic_eplb:
             raise NotImplementedError("dynamic_eplb is not supported by Ascend NPU model runner v2.")
 
+        self._configure_dflash_aux_hidden_state_layers(vllm_config)
         with torch_cuda_wrapper():
             super().__init__(vllm_config, device)
 
@@ -81,12 +82,16 @@ class NPUModelRunner(GPUModelRunner):
         del self.input_buffers
         del self.speculator
 
-        # we define AscendEagleSpeculator in vllm_ascend.worker.v2.spec_decode.eagle.speculator
-        # init_speculator will return AscendEagleSpeculator when eagle is used.
-        # so here we just call init_speculator to reinitialize speculator.
-        self.speculator: AscendEagleSpeculator | None = None
+        # Reinitialize the speculator with Ascend-specific V2 implementations.
+        self.speculator: Any | None = None
         if self.speculative_config is not None:
             self.speculator = init_speculator(self.vllm_config, self.device)
+            if self._dflash_uses_aux_hidden_state():
+                self.use_aux_hidden_state_outputs = True
+                if self.use_pp:
+                    raise ValueError(
+                        "DFlash with pipeline parallel is not supported."
+                    )
 
         # AscendRequestState has extra `num_computed_tokens_cpu` attribute.
         # so reinitialize req_states here.
@@ -141,6 +146,87 @@ class NPUModelRunner(GPUModelRunner):
         # we need to use input_batch to set forward_context in run_fullgraph.
         # so we can inherit `execute_model` method.
         self.input_batch: AscendInputBatch | None = None
+
+    @staticmethod
+    def _get_dflash_draft_hf_config(speculative_config: Any) -> Any | None:
+        if (
+            speculative_config is None
+            or speculative_config.method != "dflash"
+            or speculative_config.draft_model_config is None
+        ):
+            return None
+        return speculative_config.draft_model_config.hf_config
+
+    @classmethod
+    def _dflash_uses_aux_hidden_state_config(
+        cls, speculative_config: Any | None
+    ) -> bool:
+        hf_config = cls._get_dflash_draft_hf_config(speculative_config)
+        if hf_config is None:
+            return False
+        dflash_config = getattr(hf_config, "dflash_config", None)
+        if isinstance(dflash_config, dict) and "use_aux_hidden_state" in dflash_config:
+            return bool(dflash_config["use_aux_hidden_state"])
+        return True
+
+    @staticmethod
+    def _get_dflash_aux_layers_from_hf_config(hf_config: Any) -> tuple[int, ...] | None:
+        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if not layer_ids:
+            dflash_config = getattr(hf_config, "dflash_config", None)
+            if isinstance(dflash_config, dict):
+                layer_ids = [
+                    layer_id + 1
+                    for layer_id in (dflash_config.get("target_layer_ids") or [])
+                ]
+        if layer_ids and isinstance(layer_ids, (list, tuple)):
+            return tuple(int(layer_id) for layer_id in layer_ids)
+        return None
+
+    @classmethod
+    def _configure_dflash_aux_hidden_state_layers(cls, vllm_config: VllmConfig) -> None:
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if not cls._dflash_uses_aux_hidden_state_config(speculative_config):
+            return
+        hf_config = cls._get_dflash_draft_hf_config(speculative_config)
+        if hf_config is None:
+            return
+        if getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None):
+            return
+        aux_layers = cls._get_dflash_aux_layers_from_hf_config(hf_config)
+        if aux_layers:
+            # Upstream MRV2 reads this field during load_model before the
+            # Ascend post-load DFlash setup runs.
+            hf_config.eagle_aux_hidden_state_layer_ids = list(aux_layers)
+
+    def _dflash_uses_aux_hidden_state(self) -> bool:
+        return self._dflash_uses_aux_hidden_state_config(self.speculative_config)
+
+    def _get_dflash_aux_layers_from_config(self) -> tuple[int, ...] | None:
+        hf_config = self._get_dflash_draft_hf_config(self.speculative_config)
+        if hf_config is None:
+            return None
+        return self._get_dflash_aux_layers_from_hf_config(hf_config)
+
+    def _setup_dflash_aux_hidden_state_outputs(self) -> None:
+        if not self._dflash_uses_aux_hidden_state():
+            return
+
+        from vllm.model_executor.models.interfaces import supports_eagle3
+
+        if not supports_eagle3(self.model):
+            raise RuntimeError(
+                "Model does not support EAGLE3 interface but "
+                "DFlash aux hidden states were requested"
+            )
+        aux_layers = self._get_dflash_aux_layers_from_config()
+        if not aux_layers:
+            aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+        self.model.set_aux_hidden_state_layers(aux_layers)
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        self._setup_dflash_aux_hidden_state_outputs()
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self):

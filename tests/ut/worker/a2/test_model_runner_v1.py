@@ -6,7 +6,59 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
+from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+
+class TestNPUModelRunnerDrafter(unittest.TestCase):
+
+    def _build_dflash_drafter(self, use_aux_hidden_state=True):
+        drafter = AscendDflashProposer.__new__(AscendDflashProposer)
+        drafter.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                dflash_config={"use_aux_hidden_state": use_aux_hidden_state},
+            ),
+        )
+        return drafter
+
+    def _build_runner(self, method, drafter=None):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.speculative_config = SimpleNamespace(
+            num_speculative_tokens=4,
+            method=method,
+        )
+        runner.max_num_reqs = 2
+        runner.sampler = MagicMock()
+        runner.use_aux_hidden_state_outputs = False
+        runner._get_drafter = MagicMock(return_value=drafter or MagicMock())
+        runner._make_buffer = MagicMock(
+            return_value=torch.zeros(runner.max_num_reqs, dtype=torch.int64)
+        )
+        return runner
+
+    @patch("vllm_ascend.worker.model_runner_v1.AscendRejectionSampler")
+    @patch("vllm_ascend.worker.model_runner_v1.get_pp_group")
+    def test_dflash_reads_aux_hidden_state_config(
+        self,
+        mock_get_pp_group,
+        mock_rejection_sampler,
+    ):
+        mock_get_pp_group.return_value.is_last_rank = True
+        mock_rejection_sampler.return_value = MagicMock()
+        for use_aux_hidden_state in (True, False):
+            with self.subTest(use_aux_hidden_state=use_aux_hidden_state):
+                runner = self._build_runner(
+                    "dflash",
+                    self._build_dflash_drafter(use_aux_hidden_state),
+                )
+
+                runner._set_up_drafter()
+
+                self.assertIs(
+                    runner.use_aux_hidden_state_outputs,
+                    use_aux_hidden_state,
+                )
+                runner._get_drafter.assert_called_once()
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):

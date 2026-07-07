@@ -31,6 +31,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_ascend.core.scheduler_utils import get_effective_lookahead_tokens, scheduler_output_compat_kwargs
+
 
 class BudgetRefiner:
     """This budget refiner can make dynamic adjustment to the token budget
@@ -427,7 +429,7 @@ class SchedulerDynamicBatch(Scheduler):
                 # extra block gets allocated which
                 # creates a mismatch between the number
                 # of local and remote blocks.
-                effective_lookahead_tokens = 0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
+                effective_lookahead_tokens = get_effective_lookahead_tokens(self, load_kv_async)
 
                 # Determine if we need to allocate cross-attention blocks.
                 if self.is_encoder_decoder and request.has_encoder_inputs:
@@ -564,6 +566,7 @@ class SchedulerDynamicBatch(Scheduler):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            **scheduler_output_compat_kwargs(SchedulerOutput, self, num_scheduled_tokens),
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
