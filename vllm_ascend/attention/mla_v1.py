@@ -439,7 +439,9 @@ class AscendMLAMetadataBuilder(MLACommonMetadataBuilder[AscendMLAMetadata]):
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.decode_threshold,
-                treat_short_extends_as_decodes=common_attn_metadata.prefill_context_parallel_metadata is None,
+                treat_short_extends_as_decodes=(
+                    getattr(common_attn_metadata, "prefill_context_parallel_metadata", None) is None
+                ),
             )
         )
         self.set_num_actual_tokens(common_attn_metadata)

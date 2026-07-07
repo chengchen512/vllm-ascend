@@ -120,8 +120,13 @@ def compute_topk_logprobs(
     num_logprobs: int,
     sampled_token_ids: torch.Tensor,
     cu_num_logits: list[int] | None = None,
+    logprob_token_ids_state: object | None = None,
+    expanded_idx_mapping: torch.Tensor | None = None,
+    max_per_req_token_ids: int = 0,
 ) -> LogprobsTensors:
     assert num_logprobs >= 0
+    if max_per_req_token_ids:
+        raise NotImplementedError("NPU top-k logprobs do not support custom logprob_token_ids yet.")
     batch_size, vocab_size = logits.shape
     logprob_token_ids = sampled_token_ids.unsqueeze(-1)
     if num_logprobs > 0:

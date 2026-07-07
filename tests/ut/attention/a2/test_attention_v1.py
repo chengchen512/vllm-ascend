@@ -168,6 +168,25 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
         self.builder.build(1, common_attn_metadata, mock_model)
 
+    def test_build_accepts_common_metadata_without_ascend_extensions(self):
+        common_attn_metadata = SimpleNamespace(
+            query_start_loc=torch.tensor([0, 1, 2]),
+            query_start_loc_cpu=torch.tensor([0, 1, 2]),
+            seq_lens=torch.tensor([4, 5], dtype=torch.int32),
+            num_reqs=2,
+            num_actual_tokens=2,
+            max_query_len=1,
+            block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+            slot_mapping=torch.arange(2, dtype=torch.int32),
+            causal=True,
+        )
+
+        metadata = self.builder.build(0, common_attn_metadata)
+
+        self.assertEqual(metadata.attn_state, AscendAttentionState.DecodeOnly)
+        self.assertIsNone(metadata.kvcomp_metadata)
+        self.assertTrue(torch.equal(metadata.seq_lens, common_attn_metadata.seq_lens))
+
 
 class TestAscendAttentionBackendImpl(TestBase):
     def setUp(self):

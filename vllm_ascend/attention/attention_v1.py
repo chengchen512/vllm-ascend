@@ -288,9 +288,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         block_table = common_attn_metadata.block_table_tensor
         # Prefer _seq_lens_cpu (always available, updated during draft
         # iterations) over seq_lens_cpu (None in async spec decode mode).
-        if common_attn_metadata._seq_lens_cpu is not None:
-            seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
-        elif common_attn_metadata.seq_lens_cpu is not None:
+        seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        if seq_lens_cpu is not None:
+            seq_lens = seq_lens_cpu[:num_reqs]
+        elif getattr(common_attn_metadata, "seq_lens_cpu", None) is not None:
             seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
         else:
             seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
@@ -304,7 +305,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             seq_lens = common_attn_metadata.seq_lens
 
-        attn_state = common_attn_metadata.attn_state
+        attn_state = getattr(common_attn_metadata, "attn_state", None)
+        if attn_state is None:
+            attn_state = AscendAttentionState.DecodeOnly if num_prefills == 0 else AscendAttentionState.ChunkedPrefill
 
         # Get attn_mask from singleton AttentionMaskBuilder
         attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
@@ -365,7 +368,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
-            kvcomp_metadata=common_attn_metadata.kvcomp_metadata,
+            kvcomp_metadata=getattr(common_attn_metadata, "kvcomp_metadata", None),
         )
         return attn_metadata
 
