@@ -111,19 +111,6 @@ class NPUModelRunner(GPUModelRunner):
             device=self.device,
         )
 
-        # we need to copy num_computed_tokens back to cpu to help
-        # update actual seq_lens_cpu. gpu attention backend doesn't need these
-        # attributes, cause their attention backends doesn't use seq_lens_cpu.
-        # and seq_lens_cpu is deprecated in gpu_model_runner_v2.
-        self.num_computed_tokens_event = torch.npu.Event()
-        self.num_computed_tokens_stream = torch.npu.Stream()
-        self.num_computed_tokens_cpu = torch.empty(
-            self.max_num_reqs,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=True,
-        )
-
         # set _WEIGHT_PREFETCH_METHOD, _mc2_tokens_capacity and _reserved_mc2_mask which
         # is necessary for weight_prfetching function, and MoE communication optimization.
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
@@ -454,72 +441,22 @@ class NPUModelRunner(GPUModelRunner):
 
         return self.input_batch
 
-    def postprocess(
-        self,
-        input_batch,
-        sampled_tokens,
-        num_sampled,
-        num_rejected,
-    ):
-        """Override GPUModelRunner.postprocess for Ascend NPUs.
-        npu attention backends need seq_lens_cpu to work.
-        so we need to copy num_computed_tokens back to cpu here.
-        """
-        super().postprocess(
-            input_batch,
-            sampled_tokens,
-            num_sampled,
-            num_rejected,
-        )
-
-        self._copy_num_computed_tokens_to_cpu()
-
-    def postprocess_sampled(
-        self,
-        idx_mapping,
-        sampled_tokens,
-        num_sampled,
-        num_rejected,
-        query_start_loc=None,
-    ):
-        """Override GPUModelRunner.postprocess_sampled for Ascend NPUs."""
-        super().postprocess_sampled(
-            idx_mapping,
-            sampled_tokens,
-            num_sampled,
-            num_rejected,
-            query_start_loc,
-        )
-
-        self._copy_num_computed_tokens_to_cpu()
-
-    def _copy_num_computed_tokens_to_cpu(self):
-        # npu attention backend still need to use seq_lens_cpu,
-        # we need to copy num_computed_tokens back to cpu.
-        default_stream = torch.cuda.current_stream()
-        assert self.num_computed_tokens_stream is not None
-        assert self.num_computed_tokens_cpu is not None
-        with torch.npu.stream(self.num_computed_tokens_stream):
-            self.num_computed_tokens_stream.wait_stream(default_stream)
-            self.num_computed_tokens_cpu.copy_(
-                self.req_states.num_computed_tokens.gpu,
-                non_blocking=True,
-            )
-            self.num_computed_tokens_event.record()
-
     def _update_seq_lens_cpu(
         self,
         scheduler_output: SchedulerOutput,
         req_ids: list[str],
     ):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
-        # wait for num_computed_tokens copy to cpu stream to finish.
-        self.num_computed_tokens_event.synchronize()
-        for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+        for req_id, num_computed_tokens in zip(
+            scheduler_output.scheduled_cached_reqs.req_ids,
+            scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+        ):
             req_index = self.req_states.req_id_to_index[req_id]
-            # num_computed_tokens_cpu has reverted by num_rejected_tokens already.
-            # in super postprocess method.
-            self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
+            self.req_states.num_computed_tokens_cpu[req_index] = num_computed_tokens
+
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            req_index = self.req_states.req_id_to_index[new_req_data.req_id]
+            self.req_states.num_computed_tokens_cpu[req_index] = new_req_data.num_computed_tokens
 
         # update seq_lens_cpu
         for i, req_id in enumerate(req_ids):  # type: ignore
