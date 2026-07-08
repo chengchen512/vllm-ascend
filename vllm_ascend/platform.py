@@ -41,6 +41,7 @@ from vllm_ascend.utils import (
     COMPILATION_PASS_KEY,
     COMPRESSED_TENSORS_METHOD,
     FP8_METHOD,
+    GGUF_QUANTIZATION_METHOD,
     AscendDeviceType,
     bootstrap_custom_op_env,
     check_kv_extra_config,
@@ -141,6 +142,7 @@ class NPUPlatform(Platform):
         ASCEND_QUANTIZATION_METHOD,
         COMPRESSED_TENSORS_METHOD,
         FP8_METHOD,
+        GGUF_QUANTIZATION_METHOD,
         "deepseek_v4_fp8",
     ]
 
@@ -187,19 +189,25 @@ class NPUPlatform(Platform):
 
         adapt_patch(is_global_patch=True)
 
-        # For online serving, "ascend" quantization method is not a choice natively,
-        # so we need to add "ascend" quantization method to quantization methods list
-        # and the user can enable quantization using "vllm serve --quantization ascend".
+        # For online serving, Ascend-only quantization methods are not native
+        # parser choices, so add them before vLLM validates CLI options.
         if parser is not None:
             quant_action = parser._option_string_actions.get("--quantization")
             if quant_action and hasattr(quant_action, "choices") and quant_action.choices:
-                if ASCEND_QUANTIZATION_METHOD not in quant_action.choices:
-                    quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
+                for quant_method in (ASCEND_QUANTIZATION_METHOD, GGUF_QUANTIZATION_METHOD):
+                    if quant_method not in quant_action.choices:
+                        quant_action.choices.append(quant_method)
 
         if not is_310p():
-            from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendFp8Config, AscendModelSlimConfig  # noqa: F401
+            from vllm_ascend.quantization import (  # noqa: F401
+                AscendCompressedTensorsConfig,
+                AscendFp8Config,
+                AscendGGUFConfig,
+                AscendModelSlimConfig,
+            )
         else:
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
+            from vllm_ascend.quantization import AscendGGUFConfig  # noqa: F401
 
         config_deprecated_logging()
 

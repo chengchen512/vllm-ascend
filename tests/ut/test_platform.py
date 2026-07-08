@@ -13,6 +13,7 @@ from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
     COMPRESSED_TENSORS_METHOD,
+    GGUF_QUANTIZATION_METHOD,
     AscendDeviceType,
 )
 
@@ -66,7 +67,7 @@ class TestNPUPlatform(TestBase):
         self._enable_sp_patch = patch("vllm_ascend.utils.enable_sp", return_value=False)
         self._enable_sp_patch.start()
         self.platform = NPUPlatform()
-        self.platform.supported_quantization[:] = ["ascend", "compressed-tensors"]
+        self.platform.supported_quantization[:] = ["ascend", "compressed-tensors", "gguf"]
 
     def tearDown(self):
         self._enable_sp_patch.stop()
@@ -79,7 +80,10 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.ray_device_key, "NPU")
         self.assertEqual(NPUPlatform.device_control_env_var, "ASCEND_RT_VISIBLE_DEVICES")
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
-        self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
+        self.assertEqual(
+            NPUPlatform.supported_quantization,
+            [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD, GGUF_QUANTIZATION_METHOD],
+        )
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
@@ -97,7 +101,8 @@ class TestNPUPlatform(TestBase):
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
 
         self.assertTrue(ASCEND_QUANTIZATION_METHOD in mock_action.choices)
-        self.assertEqual(len(mock_action.choices), 3)  # original 2 + ascend
+        self.assertTrue(GGUF_QUANTIZATION_METHOD in mock_action.choices)
+        self.assertEqual(len(mock_action.choices), 4)  # original 2 + ascend + gguf
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
@@ -127,7 +132,8 @@ class TestNPUPlatform(TestBase):
         self.platform.pre_register_and_update(mock_parser)
 
         mock_adapt_patch.assert_called_once_with(is_global_patch=True)
-        self.assertEqual(len(mock_action.choices), 2)
+        self.assertTrue(GGUF_QUANTIZATION_METHOD in mock_action.choices)
+        self.assertEqual(len(mock_action.choices), 3)
 
     def test_apply_config_platform_defaults_sets_ascend_default_max(self):
         test_cases = [
