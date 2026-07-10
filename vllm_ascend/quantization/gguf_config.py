@@ -22,7 +22,7 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.layers.quantization.gguf import (
+from vllm_gguf_plugin.quantization.config import (
     GGUFConfig,
     is_layer_skipped_gguf,
 )

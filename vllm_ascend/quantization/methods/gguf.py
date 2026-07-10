@@ -20,12 +20,12 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from vllm.model_executor.layers.quantization.gguf import (
+from vllm_gguf_plugin.quantization.linear import (
     DEQUANT_TYPES,
-    GGUFEmbeddingMethod,
     GGUFLinearMethod,
     UNQUANTIZED_TYPES,
 )
+from vllm_gguf_plugin.quantization.vocal_embeds import GGUFEmbeddingMethod
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 
 
