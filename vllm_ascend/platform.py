@@ -36,6 +36,7 @@ from vllm_ascend.ascend_config import init_ascend_config
 # isort: off
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
+    AWQ_QUANTIZATION_METHOD,
     COMPILATION_PASS_KEY,
     COMPRESSED_TENSORS_METHOD,
     AscendDeviceType,
@@ -100,7 +101,11 @@ class NPUPlatform(Platform):
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
     dispatch_key: str = "PrivateUse1"
 
-    supported_quantization: list[str] = [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD]
+    supported_quantization: list[str] = [
+        ASCEND_QUANTIZATION_METHOD,
+        AWQ_QUANTIZATION_METHOD,
+        COMPRESSED_TENSORS_METHOD,
+    ]
 
     def is_sleep_mode_available(self) -> bool:
         return True
@@ -147,7 +152,11 @@ class NPUPlatform(Platform):
                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
 
         if not is_310p():
-            from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendModelSlimConfig  # noqa: F401
+            from vllm_ascend.quantization import (  # noqa: F401
+                AscendAWQConfig,
+                AscendCompressedTensorsConfig,
+                AscendModelSlimConfig,
+            )
         else:
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
 
