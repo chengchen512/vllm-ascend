@@ -15,11 +15,8 @@
 # limitations under the License.
 #
 
-import json
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
 from math import gcd
 from typing import Any
 
@@ -45,48 +42,6 @@ AWQ_TRITON_BLOCK_SIZE = 1024
 AWQ_PACK_FACTOR = 8
 
 logger = init_logger(__name__)
-
-_PROJECT_AWQ_SEEN: set[tuple[str, int, int, int]] = set()
-
-
-@lru_cache(maxsize=1)
-def _project_awq_allowed_shapes() -> frozenset[tuple[int, int]]:
-    raw = os.environ.get("VLLM_ASCEND_PROJECT_AWQ_SHAPES", "")
-    shapes: set[tuple[int, int]] = set()
-    for item in raw.split(","):
-        item = item.strip().lower()
-        if not item:
-            continue
-        k_text, separator, n_text = item.partition("x")
-        if not separator:
-            raise ValueError(
-                "VLLM_ASCEND_PROJECT_AWQ_SHAPES entries must use KxN syntax"
-            )
-        shapes.add((int(k_text), int(n_text)))
-    return frozenset(shapes)
-
-
-def _trace_project_awq(route: str, m: int, k: int, n: int) -> None:
-    key = (route, m, k, n)
-    if key in _PROJECT_AWQ_SEEN:
-        return
-    _PROJECT_AWQ_SEEN.add(key)
-    logger.info("Project AWQ route=%s shape=[%d,%d,%d]", route, m, k, n)
-    trace_path = os.environ.get("VLLM_ASCEND_PROJECT_AWQ_TRACE")
-    if trace_path:
-        with open(trace_path, "a", encoding="utf-8") as output:
-            output.write(
-                json.dumps(
-                    {"pid": os.getpid(), "route": route, "shape": [m, k, n]}
-                )
-                + "\n"
-            )
-
-
-def _project_awq_shape(layer: torch.nn.Module, x: torch.Tensor) -> tuple[int, int, int]:
-    m, k = x.shape
-    n = layer.weight_scale.shape[-1]
-    return int(m), int(k), int(n)
 
 
 @dataclass(frozen=True)
@@ -320,13 +275,10 @@ def pack_awq_weight_to_ascend(
     inner_k_tiles: int = AWQ_INT4PACK_INNER_K_TILES,
 ) -> torch.Tensor:
     _validate_awq_tensor("qweight", qweight)
-    if (
-        inner_k_tiles == AWQ_INT4PACK_INNER_K_TILES
-        and qweight.device.type == "npu"
-        and _has_triton()
-    ):
+    if inner_k_tiles == AWQ_INT4PACK_INNER_K_TILES and qweight.device.type == "npu" and _has_triton():
         try:
             from vllm_ascend.ops.triton.awq_conversion import awq_direct_pack
+
             return awq_direct_pack(qweight, block_size=AWQ_TRITON_BLOCK_SIZE)
         except (ImportError, ModuleNotFoundError) as exc:
             logger.warning_once("AWQ direct Triton pack unavailable: %s", exc)
@@ -375,6 +327,7 @@ def prepare_awq_zero_offset(
     if qzeros.device.type == "npu" and scales.device.type == "npu" and _has_triton():
         try:
             from vllm_ascend.ops.triton.awq_conversion import awq_zero_offset_triton
+
             return awq_zero_offset_triton(qzeros, scales, output_size)
         except (ImportError, ModuleNotFoundError) as exc:
             logger.warning_once("AWQ Triton zero offset unavailable: %s", exc)
@@ -535,9 +488,7 @@ class AscendAWQLinearMethod(AWQLinearMethod):
         input_size: int,
     ) -> None:
         if plan is not None:
-            layer.awq_runtime_group_size = (
-                0 if plan.local_num_groups == 1 else plan.runtime_group_size
-            )
+            layer.awq_runtime_group_size = 0 if plan.local_num_groups == 1 else plan.runtime_group_size
             return
         if self.quant_config.group_size == -1 or self.quant_config.group_size == input_size:
             layer.awq_runtime_group_size = 0
@@ -629,31 +580,6 @@ class AscendAWQLinearMethod(AWQLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        project_enabled = os.environ.get("VLLM_ASCEND_USE_PROJECT_AWQ", "0") == "1"
-        if project_enabled and x.dim() == 2:
-            m, k, n = _project_awq_shape(layer, x)
-            allowed = _project_awq_allowed_shapes()
-            eligible = (
-                bias is None
-                and x.dtype == torch.float16
-                and x.is_contiguous()
-                and m <= 16
-                and getattr(layer, "awq_runtime_group_size", 0) == 128
-                and (k, n) in allowed
-            )
-            if eligible:
-                import ascend_kernel  # noqa: F401
-
-                output = torch.ops.npu.awq_w4a16_linear(
-                    x,
-                    layer.weight,
-                    layer.weight_scale,
-                    layer.weight_offset,
-                )
-                _trace_project_awq("project_custom", m, k, n)
-                return output
-            _trace_project_awq("vendor_fallback", m, k, n)
-
         return torch_npu.npu_weight_quant_batchmatmul(
             x=x,
             weight=layer.weight,
@@ -753,9 +679,7 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
         w2_output_size = hidden_size
         weight_loader = extra_weight_attrs.get("weight_loader")
         group_weight_loader = (
-            _awq_moe_group_weight_loader(weight_loader, w13_plan, w2_plan)
-            if weight_loader is not None
-            else None
+            _awq_moe_group_weight_loader(weight_loader, w13_plan, w2_plan) if weight_loader is not None else None
         )
 
         w13_qweight = PackedvLLMParameter(
@@ -887,17 +811,13 @@ class AscendAWQFusedMoEMethod(FusedMoEMethodBase):
         # arguments at this compatibility boundary.
         from vllm_ascend.quantization.methods.w4a16 import AscendW4A16FusedMoEMethod
 
-        dynamic_eplb = bool(
-            kwargs.pop("dynamic_eplb", getattr(layer, "dynamic_eplb", False))
-        )
+        dynamic_eplb = bool(kwargs.pop("dynamic_eplb", getattr(layer, "dynamic_eplb", False)))
         kwargs.pop("tid2eid", None)
         kwargs.pop("input_ids", None)
         if "num_experts" in kwargs and "global_num_experts" not in kwargs:
             kwargs["global_num_experts"] = kwargs.pop("num_experts")
 
-        native_method = AscendW4A16FusedMoEMethod.__new__(
-            AscendW4A16FusedMoEMethod
-        )
+        native_method = AscendW4A16FusedMoEMethod.__new__(AscendW4A16FusedMoEMethod)
         native_method.dynamic_eplb = dynamic_eplb
         return native_method.apply(layer, *args, **kwargs)
 

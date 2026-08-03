@@ -49,9 +49,7 @@ def _make_awq_tensors(
     scale_dtype: torch.dtype = torch.float16,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     qweight_values = torch.arange(input_size * output_size, dtype=torch.int32).view(input_size, output_size) % 16
-    qzero_values = (
-        torch.arange(num_groups * output_size, dtype=torch.int32).view(num_groups, output_size).add_(3) % 16
-    )
+    qzero_values = torch.arange(num_groups * output_size, dtype=torch.int32).view(num_groups, output_size).add_(3) % 16
     scales = torch.arange(1, num_groups * output_size + 1, dtype=torch.float32).view(num_groups, output_size)
     return _pack_int4(qweight_values), _pack_int4(qzero_values), scales.to(scale_dtype)
 
@@ -111,6 +109,34 @@ def test_awq_pack_matches_reference(
     reference_weight = pack_awq_weight_to_ascend_reference(qweight, output_size)
     torch.npu.synchronize()
     torch.testing.assert_close(packed_weight.cpu(), reference_weight.cpu(), rtol=0, atol=0)
+
+
+def test_awq_linear_uses_torch_npu_vendor_op():
+    config = AscendAWQConfig.from_config({"bits": 4, "group_size": 128, "zero_point": True})
+    method = AscendAWQLinearMethod(config)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.empty(128, 2, dtype=torch.int32), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(torch.empty(1, 16, dtype=torch.float16), requires_grad=False)
+    layer.weight_offset = torch.nn.Parameter(torch.empty(1, 16, dtype=torch.float16), requires_grad=False)
+    layer.awq_runtime_group_size = 128
+    hidden_states = torch.empty(1, 128, dtype=torch.float16)
+    expected = torch.empty(1, 16, dtype=torch.float16)
+
+    with patch(
+        "vllm_ascend.quantization.methods.awq.torch_npu.npu_weight_quant_batchmatmul",
+        return_value=expected,
+    ) as vendor_op:
+        output = method.apply(layer, hidden_states)
+
+    assert output is expected
+    vendor_op.assert_called_once_with(
+        x=hidden_states,
+        weight=layer.weight,
+        antiquant_scale=layer.weight_scale,
+        antiquant_offset=layer.weight_offset,
+        antiquant_group_size=128,
+        bias=None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -178,9 +204,7 @@ def test_awq_group_plan(
         moe_config.tp_rank = tp_rank
         layer = torch.nn.Module()
         layer.moe_config = moe_config
-        config = AscendAWQConfig.from_config(
-            {"bits": 4, "group_size": checkpoint_group_size, "zero_point": True}
-        )
+        config = AscendAWQConfig.from_config({"bits": 4, "group_size": checkpoint_group_size, "zero_point": True})
         method = AscendAWQFusedMoEMethod(config, moe_config)
         with (
             patch(
